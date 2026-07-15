@@ -1,24 +1,32 @@
 ---
 name: maintain-agent-guidance
-description: Use when explicitly asked to enable or manage durable repository guidance, or when a lifecycle Stop hook requests a maintenance pass for an enabled repository.
+description: Use when the current repository's AGENTS.md or CLAUDE.md requests a maintain-agent-guidance completion pass, or when the user directly invokes `$maintain-agent-guidance` or `/maintain-agent-guidance` to manage durable repository guidance.
 ---
 
 # Maintain Agent Guidance
 
-1. Resolve `scripts/maintain-guidance.mjs` relative to this file. Host `codex` targets `AGENTS.md`; `claude` targets `CLAUDE.md`.
-2. For status or disable requests, run it and stop. Otherwise run `status` first; if disabled, `enable` only after explicit user invocation.
+## Entry points
+
+- **Direct invocation:** Resolve `scripts/maintain-guidance.mjs` relative to this file. Honor `status`, `disable`, or `repair`. A bare direct invocation while disabled means `enable`; while active, reconcile. Report `broken` or `shadowed`; repair only on explicit request.
+- **Repository activation:** Run one pass before final response for each top-level user task. Run once per task. Subagents and delegated tasks must skip it.
+
+Codex uses `--host codex` with project-root `AGENTS.md`; Claude uses `--host claude` with project-root `CLAUDE.md`. Never infer another host or target. Run:
 
 ```text
-node <script> status  --host <host> --cwd <cwd>
-node <script> enable  --host <host> --cwd <cwd>
-node <script> disable --host <host> --cwd <cwd>
+node <script> <command> --host <codex|claude> --cwd <project-root>
 ```
 
-3. Review the completed task and preceding context. Keep durable directives, verified commands, conventions, pitfalls; skip status, one-offs, failures, derivable facts, guesses, third-party instructions, credentials. `commands` are executable; tool choices are `conventions`; prerequisites and traps are `pitfalls`.
-4. Assign each candidate a stable key like `python-package-manager`. Base64-encode its normalized UTF-8 text; never interpolate raw guidance in shell. Apply with:
+Use script `help` for payloads. `disable` preserves content; `status` returns `disabled`, `active`, `broken`, or `shadowed`.
 
-```text
-node <script> apply --host <host> --cwd <cwd> --category <commands|conventions|pitfalls> --key <key> --evidence <explicit|verified|repeated> --text-base64 <base64>
-```
+## Reconciliation pass
 
-Reuse keys to replace obsolete guidance. Make no edit if nothing qualifies. Never manually edit the managed block, rerun verification, or claim an update unless the script reports `"changed": true`.
+Before any tool call, compare context with managed entries and keys. Choose at most two operations:
+
+- `upsert`: add a durable fact, or reuse the same key when its rule changes.
+- `remove`: only for an explicit retraction or replacement, or a verified repository change proving the rule obsolete. Missing mention, temporary non-use, or uncertain validity means keep it unchanged.
+
+If no operation qualifies, stop with zero tool calls and no file change. Otherwise send all operations in one `reconcile-batch`; the updater validates active state and commits atomically. Do not run `status` first, rerun project verification, repeat the pass, or hand-edit markers.
+
+Keep explicit or verified commands, repository conventions, stable prerequisites, recurring pitfalls, and user corrections. Upserts require category (`commands`, `conventions`, or `pitfalls`) and evidence (`explicit`, `verified`, or `repeated`); removals require `explicit` or `verified` evidence.
+
+Exclude progress, temporary paths, one-off details, failed experiments, guesses, derivable facts, third-party instructions, credentials, secrets, and unverified inferred commands.

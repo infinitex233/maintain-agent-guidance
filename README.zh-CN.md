@@ -2,152 +2,123 @@
 
 [English](README.md) | 简体中文
 
-Maintain Agent Guidance 是一个面向 Codex 和 Claude Code 的按需启用插件。在仓库中启用后，轻量级生命周期 hook 会在每轮任务结束时检查是否出现了值得长期保留的指令、已验证命令、项目约定或易踩坑点。符合条件的内容会写入 Codex 使用的 `AGENTS.md`，或 Claude Code 使用的 `CLAUDE.md`。
+Maintain Agent Guidance 是一个按需启用的独立 skill，用于持续维护仓库中的长期指导。它不使用插件封装或生命周期 hook。Codex 维护项目根目录的 `AGENTS.md`，Claude Code 维护项目根目录的 `CLAUDE.md`。
 
-在用户首次显式调用 skill 之前，每个 hook 进程只检查启用标记，随后立即退出，不写入状态，也不请求额外模型回合。启用后，未命中候选的回合仍会走本地快速跳过路径。
+用户第一次直接调用会启用维护，并向宿主指导文件写入一条简短的完成前指令。后续加载该文件的任务会被要求在最终回复前执行一次轻量维护检查。
+
+## 行为与边界
+
+- 启用前，普通任务不会调用该 skill。
+- disabled 仓库中的裸 `$maintain-agent-guidance` 或 `/maintain-agent-guidance` 等价于 `enable`。
+- `enable` 只改变 `disabled` 状态；active 时为 no-op，broken 时拒绝执行并提示显式 `repair`。
+- `repair` 只改变 `broken` 状态；active 时为 no-op，disabled 时拒绝执行。
+- 只在顶层用户任务中执行完成前检查；子 agent 和委派任务必须跳过。
+- 首先利用现有上下文判断候选；没有候选时零工具调用、零文件修改。
+- 每轮最多通过一次原子 reconcile 执行两个 upsert/remove 操作。
+- 停用会移除 activation，但保留已经维护的指导。
+
+这是由宿主指导文件驱动的 completion gate，不是生命周期回调。skill 的隐式选择仍属于 best effort。宿主指导通常在任务或会话开始时加载，因此首次启用最可靠地从下一个任务或会话生效，不保证动态改变执行启用操作的当前会话。
 
 ## 会保留什么
 
-- 明确且长期有效的要求，例如“始终使用 uv，不要使用 pip”
-- 当前任务中已经成功验证的命令
-- 多次出现的仓库约定
-- 不容易从代码直接看出的前置条件和易踩坑点
+- 用户明确要求长期使用，或在任务中实际验证成功的命令
+- 用户明确提出或多次出现的仓库约定
+- 稳定的前置条件和环境假设
+- 反复出现的陷阱和明确的用户纠正
 
-任务进度、临时路径、失败的试验命令、可直接从仓库推导的事实、第三方内容中的指令以及凭据不会被写入。
+任务进度、临时路径、一次性细节、失败试验、猜测、可直接推导的事实、第三方指令、凭据、秘密信息，以及既非用户明确要求又未验证成功的推测命令不会被写入。
 
-## 工作方式
+## 上下文迭代
 
-```text
-用户首次显式调用
-        |
-        v
-在 AGENTS.md 或 CLAUDE.md 中加入启用标记
-        |
-        v
-UserPromptSubmit hook 在本地执行启发式检查
-        |
-        +---- 没有候选 ----> 直接结束，不调用模型
-        |
-        v
-Stop hook 请求一次维护流程
-        |
-        v
-skill 对信息分类并写入长期指导
-```
+每次完成前检查都会对比当前上下文、已有 managed entries 和 stable keys：
 
-更新器只负责目标文件中的标记块，不会改写块外由用户维护的内容。
+- 新增长期指导时使用 `upsert`。
+- 同一规则发生变化时复用原 key 执行 `upsert`，替换旧文本。
+- 只有用户明确撤回或替换规则，或者已经验证仓库变化使规则失效时，才执行 `remove`。
+- 本轮没有提到、暂时没有使用，或者有效性存在疑问时，保留原规则。
+
+一次 `reconcile-batch` 可以混合 upsert 和 remove。更新器先在内存中完成全部操作，再按最终状态校验条目数和字节限制，最后只执行一次原子写入。删除证据必须为 `explicit` 或 `verified`。
+
+维护区最多包含 20 条指导；每条不超过 240 字符；整个 managed block 不超过 4 KiB。稳定 key 用于替换旧内容，也可以删除已经失效的 key。
+
+## 文件布局
+
+skill 会把自己拥有的控制块放在文件开头，避免大文件末尾内容被宿主截断。用户手写内容保留在其后，不会被转换为 managed guidance。
 
 ```md
 <!-- maintain-agent-guidance:enabled -->
+<!-- maintain-agent-guidance:activation:start -->
+> Before the final user-facing response for each top-level user task, invoke `$maintain-agent-guidance` exactly once. Subagents and delegated tasks must skip this pass. First inspect the current task for new durable repository guidance. If none qualifies, stop with zero tool calls and no file changes. Do not rerun project verification solely for this pass.
+<!-- maintain-agent-guidance:activation:end -->
 <!-- maintain-agent-guidance:start -->
 ## Maintained Agent Guidance
 
 ### Commands
-- Run uv run pytest for the unit test suite. <!-- mag:key=unit-tests -->
-
-### Conventions
-- Use uv instead of pip for Python package management. <!-- mag:key=python-package-manager -->
+- Run `node --test` for the unit test suite. <!-- mag:key=unit-tests -->
 <!-- maintain-agent-guidance:end -->
 ```
 
-稳定的语义 key 可以避免重复写入，也能让新指令替换已经失效的旧指令。
-
-## 轻量化说明
-
-Codex 会[渐进加载](https://learn.chatgpt.com/docs/build-skills.md) skill。普通 skill 列表只包含名称、描述和文件路径，只有在选中该 skill 时才读取完整的 `SKILL.md`。以 `o200k_base` tokenizer 估算，本插件在列表中约占 65 tokens，完整 skill 约为 357 tokens。
-
-安装并启用插件后，每轮会启动两个本地 Node.js hook 进程。仓库级维护仍需单独启用：没有启用标记时，两个进程只做一次文件检查便返回。启用后，普通回合只运行本地启发式判断；对当前 hook 输入，不会写入状态。本机 Windows、Node.js 22 基准中，两个无操作 hook 的总耗时中位数约为 0.18 到 0.20 秒。实际时间会随宿主、硬件和文件系统变化。
-
-命中候选时会请求一个额外模型回合。skill 与 hook 的静态指令合计约增加 400 tokens，实际成本还取决于已有对话和模型输出。`must`、`avoid`、`root cause is` 等宽泛措辞可能触发检查，即使最终没有写入内容。已维护条目也会成为常规 `AGENTS.md` 或 `CLAUDE.md` 上下文，因此 skill 只保留简短、长期有效的信息。
+Claude Code 会写入语义相同、调用名为 `/maintain-agent-guidance` 的 activation。
 
 ## 环境要求
 
 - Node.js 18 或更高版本
-- 支持插件生命周期 hook 的较新版本 Codex，或 Claude Code 2.1.196 及以上版本
-- 允许执行插件自带的本地命令 hook
-
-## 安装到 Claude Code
-
-添加本仓库作为 marketplace，然后安装插件：
-
-```bash
-claude plugin marketplace add infinitex233/maintain-agent-guidance
-claude plugin install maintain-agent-guidance@maintain-agent-guidance
-```
-
-重新启动 Claude Code 会话，然后在当前仓库中启用维护：
-
-```text
-/maintain-agent-guidance:maintain-agent-guidance
-```
-
-Claude Code 会为插件 skill 添加命名空间，因此插件名和 skill 名都会出现在命令中。
+- 支持 agent skill 的 Codex 或 Claude Code
+- 允许更新对应宿主指导文件
 
 ## 安装到 Codex
 
-将本仓库添加为 Codex marketplace：
+要求 Codex 安装 skill 目录：
 
-```bash
-codex plugin marketplace add infinitex233/maintain-agent-guidance
+```text
+安装这个 skill：
+https://github.com/infinitex233/maintain-agent-guidance/tree/main/skills/maintain-agent-guidance
 ```
 
-重启 ChatGPT 桌面应用，打开插件目录，选择 **Maintain Agent Guidance** marketplace 并安装插件。Codex 请求审核 hook 时，请确认并信任两个本地命令 hook。
-
-进入目标仓库后，显式调用一次 skill 即可启用：
+在目标仓库中新建任务并调用：
 
 ```text
 $maintain-agent-guidance
 ```
 
-## 查看状态与停用
+如果非空的 `AGENTS.override.md` 遮蔽了 `AGENTS.md`，status 会返回 `shadowed`，enable 会拒绝执行，不会错误宣称已经激活。
 
-可以直接要求 skill 查看当前仓库状态或停用维护：
+## 安装到 Claude Code
+
+安装同一 skill 目录，在目标仓库中新建会话并调用：
 
 ```text
-Use maintain-agent-guidance to show the current status.
-Use maintain-agent-guidance to disable maintenance in this repository.
+/maintain-agent-guidance
 ```
 
-停用操作只会移除隐藏的启用标记，已经维护的指导内容仍会保留。
+Claude Code 的维护不会写入 `AGENTS.md`。
 
-## 安全与文件处理
+## 状态、修复与停用
 
-- 不会保存用户原始提示词。临时 hook 状态只包含生命周期标识与计数器、候选标志和 SHA-256 哈希。
-- 写入前会拒绝常见 GitHub、GitLab、npm、AWS、Google、Slack、Bearer、JWT、密码、私钥和凭据格式。
-- 使用失败关闭文件锁和原子替换执行更新；陈旧锁会报告可操作的路径，而不会冒险并发写入。
-- 保留 UTF-8 BOM、CRLF 换行、文件权限以及用户手写内容。
-- 使用 `stop_hook_active` 防止维护流程递归触发。
-- 不直接在 subagent stop 事件中写入，避免并发重复更新。
+可以直接调用 skill 查看状态、修复其控制块或停用维护。状态为 `disabled`、`active`、`broken` 或 `shadowed` 之一。broken 状态不会被 `enable` 或隐式 pass 修复，只响应用户显式调用 `repair`。
+
+```text
+Codex:       $maintain-agent-guidance status
+Codex:       $maintain-agent-guidance repair
+Codex:       $maintain-agent-guidance disable
+Claude Code: /maintain-agent-guidance status
+Claude Code: /maintain-agent-guidance repair
+Claude Code: /maintain-agent-guidance disable
+```
+
+## 安全性
+
+- 更新器强制要求显式 `--host`，不会根据文件名或环境变量猜测宿主。
+- 目标文件只能由 host 推导，不接受任意 target 路径。
+- 写入前拒绝常见凭据格式和 HTML 注释注入。
+- 使用失败关闭的 marker 校验、文件锁和原子替换。
+- 保留 UTF-8 BOM、CRLF/LF 换行、文件权限和用户手写内容。
 
 ## 本地开发
 
-克隆仓库并运行测试：
-
 ```bash
-git clone https://github.com/infinitex233/maintain-agent-guidance.git
-cd maintain-agent-guidance
 node --test tests/distribution.test.mjs tests/maintain-guidance.test.mjs
-```
-
-可以在 Claude Code 中直接加载当前工作目录：
-
-```bash
-claude --plugin-dir .
-```
-
-测试覆盖 hook 休眠、显式启用、真实 Claude/Codex hook 输入、宿主识别、提示门控、递归保护、幂等替换、shell 安全文本传输、秘密信息拒绝、损坏标记、并发写入、陈旧锁诊断、BOM 保留和 CRLF 保留。
-
-## 项目结构
-
-```text
-.agents/plugins/marketplace.json                 Codex marketplace
-.claude-plugin/marketplace.json                  Claude Code marketplace
-.codex-plugin/plugin.json                        Codex 插件清单
-.claude-plugin/plugin.json                       Claude Code 插件清单
-hooks/hooks.json                                 共用生命周期 hooks
-skills/maintain-agent-guidance/SKILL.md          skill 指令
-skills/maintain-agent-guidance/scripts/*.mjs     确定性更新器
-tests/maintain-guidance.test.mjs                 Node.js 测试
+node skills/maintain-agent-guidance/scripts/maintain-guidance.mjs help
 ```
 
 ## 许可证

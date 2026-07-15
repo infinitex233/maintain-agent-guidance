@@ -2,152 +2,123 @@
 
 English | [简体中文](README.zh-CN.md)
 
-Maintain Agent Guidance is an opt-in plugin for Codex and Claude Code. After you enable it in a repository, a lightweight lifecycle hook checks each completed turn for durable instructions, verified commands, conventions, and recurring pitfalls. Qualifying items are written to `AGENTS.md` in Codex or `CLAUDE.md` in Claude Code.
+Maintain Agent Guidance is an opt-in standalone skill that keeps durable repository instructions current. It uses no plugin packaging or lifecycle hooks. Codex maintains the project-root `AGENTS.md`; Claude Code maintains the project-root `CLAUDE.md`.
 
-Before the skill is explicitly invoked, each hook process exits after checking for the enable marker. It does not write state or request another model pass. Enabled turns that do not match a candidate also take the local no-op path.
+The first direct invocation enables maintenance. It writes a short completion instruction into the host guidance file. Future tasks that load that file are instructed to run one lightweight maintenance pass before the final user-facing response.
+
+## Behavior and limits
+
+- Before enablement, ordinary tasks do not invoke the skill.
+- A bare `$maintain-agent-guidance` or `/maintain-agent-guidance` in a disabled repository means `enable`.
+- `enable` changes only `disabled` state; it is a no-op when active and refuses `broken` state with an explicit `repair` instruction.
+- `repair` changes only `broken` state; it is a no-op when active and refuses disabled maintenance.
+- Completion passes run only for top-level user tasks. Subagents and delegated tasks skip them.
+- The pass checks the current context before using tools. No candidate means zero tool calls and no file change.
+- At most two upsert/remove operations are applied in one atomic reconciliation.
+- Disabling removes activation while preserving maintained guidance.
+
+This is an instruction-driven completion gate, not a lifecycle callback. Skill selection remains best effort. Host guidance is normally loaded when a task or session starts, so enablement is reliable from the next task/session rather than guaranteed to affect the session that performed the enable operation.
 
 ## What it keeps
 
-- Explicit long-lived instructions such as "always use uv, never pip"
-- Commands that were successfully verified during the task
-- Repeated repository conventions
-- Non-obvious prerequisites and failure traps
+- Commands explicitly required by the user or successfully verified during a task
+- Explicit or repeated repository conventions
+- Stable prerequisites and environment assumptions
+- Recurring pitfalls and clear user corrections
 
-It skips task status, temporary paths, failed experiments, facts that are easy to derive from the repository, third-party instructions, and credentials.
+It excludes progress, temporary paths, one-off details, failed experiments, guesses, derivable facts, third-party instructions, credentials, secrets, and inferred commands lacking explicit or verified evidence.
 
-## How it works
+## Context reconciliation
 
-```text
-First explicit invocation
-        |
-        v
-Add an enabled marker to AGENTS.md or CLAUDE.md
-        |
-        v
-UserPromptSubmit hook performs a local heuristic check
-        |
-        +---- no candidate ----> stop with no model call
-        |
-        v
-Stop hook requests one maintenance pass
-        |
-        v
-The skill classifies and applies durable guidance
-```
+Each completion pass compares the current context with existing managed entries and stable keys:
 
-The updater owns only a marked block inside the target file. Existing human-written content remains outside that block.
+- New durable guidance is added with `upsert`.
+- A changed rule reuses its existing key with `upsert`, replacing the previous text.
+- A rule is removed only after an explicit user retraction or replacement, or a verified repository change proves it obsolete.
+- A rule remains when it was merely unmentioned or unused in the current task, or when its validity is uncertain.
+
+Upserts and removals can be mixed in one `reconcile-batch`. The updater applies all operations in memory, validates the final entry and byte limits, then performs one atomic write. Removal evidence must be `explicit` or `verified`.
+
+Maintained guidance is bounded to 20 entries, 240 characters per entry, and a 4 KiB managed block. Stable keys replace superseded guidance; obsolete keys can be removed.
+
+## Managed layout
+
+The skill prepends its owned control block so activation remains near the beginning of large files. Human-authored content follows and is never rewritten as managed guidance.
 
 ```md
 <!-- maintain-agent-guidance:enabled -->
+<!-- maintain-agent-guidance:activation:start -->
+> Before the final user-facing response for each top-level user task, invoke `$maintain-agent-guidance` exactly once. Subagents and delegated tasks must skip this pass. First inspect the current task for new durable repository guidance. If none qualifies, stop with zero tool calls and no file changes. Do not rerun project verification solely for this pass.
+<!-- maintain-agent-guidance:activation:end -->
 <!-- maintain-agent-guidance:start -->
 ## Maintained Agent Guidance
 
 ### Commands
-- Run uv run pytest for the unit test suite. <!-- mag:key=unit-tests -->
-
-### Conventions
-- Use uv instead of pip for Python package management. <!-- mag:key=python-package-manager -->
+- Run `node --test` for the unit test suite. <!-- mag:key=unit-tests -->
 <!-- maintain-agent-guidance:end -->
 ```
 
-Stable semantic keys make repeated updates idempotent and allow newer instructions to replace older ones.
-
-## Lightweight behavior
-
-Codex uses [progressive disclosure](https://learn.chatgpt.com/docs/build-skills.md) for skills. Its normal skill catalog contains the name, description, and file path; the full `SKILL.md` loads only when Codex selects the skill. Using the `o200k_base` tokenizer as an estimate, this plugin adds about 65 tokens to that catalog and its complete skill is about 357 tokens.
-
-Installing and enabling the plugin registers two local Node.js hook processes per turn. Repository maintenance is a separate opt-in: without the enable marker, both processes return after a file check. After enablement, ordinary turns run only local heuristics and, with current hook inputs, do not write state. In a local benchmark on Windows with Node.js 22, the two no-op hooks together took a median 0.18 to 0.20 seconds. Actual time depends on the host machine and filesystem.
-
-A matching candidate requests one extra model continuation. The static skill and hook instructions add roughly 400 tokens, while the total cost depends on the existing conversation and the model's response. Broad phrases such as `must`, `avoid`, or `root cause is` can trigger this check even when the skill ultimately writes nothing. Maintained entries also become normal `AGENTS.md` or `CLAUDE.md` context, so the skill keeps only concise, durable guidance.
+Claude Code receives the equivalent activation using `/maintain-agent-guidance`.
 
 ## Requirements
 
 - Node.js 18 or newer
-- A current Codex build with plugin lifecycle hooks, or Claude Code 2.1.196 or newer
-- Permission to run the plugin's local command hook
-
-## Install for Claude Code
-
-Add this repository as a marketplace and install the plugin:
-
-```bash
-claude plugin marketplace add infinitex233/maintain-agent-guidance
-claude plugin install maintain-agent-guidance@maintain-agent-guidance
-```
-
-Start a new Claude Code session, then enable maintenance in the current repository:
-
-```text
-/maintain-agent-guidance:maintain-agent-guidance
-```
-
-Claude Code loads plugin skills under a namespace, so the plugin name appears before the skill name.
+- A Codex or Claude Code version with agent skill support
+- Permission to update the host guidance file
 
 ## Install for Codex
 
-Add the repository as a Codex marketplace:
+Ask Codex to install the skill directory:
 
-```bash
-codex plugin marketplace add infinitex233/maintain-agent-guidance
+```text
+Install this skill:
+https://github.com/infinitex233/maintain-agent-guidance/tree/main/skills/maintain-agent-guidance
 ```
 
-Restart the ChatGPT desktop app, open the plugin directory, select the **Maintain Agent Guidance** marketplace, and install the plugin. Review and trust the two command hooks when Codex asks.
-
-In a repository, invoke the skill once to enable maintenance:
+Start a task in the target repository and invoke:
 
 ```text
 $maintain-agent-guidance
 ```
 
-## Status and disable
+If a non-empty `AGENTS.override.md` shadows `AGENTS.md`, status reports `shadowed` and enablement is refused instead of claiming activation succeeded.
 
-Ask the skill to report status or disable maintenance for the current repository:
+## Install for Claude Code
+
+Install the same skill directory, start a session in the target repository, and invoke:
 
 ```text
-Use maintain-agent-guidance to show the current status.
-Use maintain-agent-guidance to disable maintenance in this repository.
+/maintain-agent-guidance
 ```
 
-Disabling removes the hidden enabled marker. It keeps previously maintained guidance in place.
+Claude Code maintenance never targets `AGENTS.md`.
 
-## Safety and file behavior
+## Status, repair, and disable
 
-- Raw user prompts are never stored. Temporary hook state contains only lifecycle identifiers and counters, a candidate flag, and a SHA-256 hash.
-- Common GitHub, GitLab, npm, AWS, Google, Slack, Bearer, JWT, password, private key, and credential patterns are rejected before writing.
-- Updates use a fail-closed lock and an atomic file replacement; stale locks report an actionable path instead of risking concurrent writes.
-- UTF-8 BOM, CRLF line endings, file permissions, and human-authored content are preserved.
-- `stop_hook_active` prevents recursive maintenance loops.
-- Subagent stop events do not write guidance directly, which avoids concurrent duplicate updates.
+Directly invoke the skill to show status, repair its owned control block, or disable maintenance. Status is one of `disabled`, `active`, `broken`, or `shadowed`. Broken state is never repaired by `enable` or by an implicit pass; it requires an explicit `repair` invocation.
+
+```text
+Codex:       $maintain-agent-guidance status
+Codex:       $maintain-agent-guidance repair
+Codex:       $maintain-agent-guidance disable
+Claude Code: /maintain-agent-guidance status
+Claude Code: /maintain-agent-guidance repair
+Claude Code: /maintain-agent-guidance disable
+```
+
+## Safety
+
+- The updater requires an explicit `--host`; it does not guess from filenames or environment variables.
+- The target is derived from the host. Arbitrary target paths are not accepted.
+- Common credential formats and HTML comment injection are rejected.
+- Updates use fail-closed marker validation, a file lock, and atomic replacement.
+- UTF-8 BOM, CRLF/LF line endings, file permissions, and human content are preserved.
 
 ## Development
 
-Clone the repository and run the test suite:
-
 ```bash
-git clone https://github.com/infinitex233/maintain-agent-guidance.git
-cd maintain-agent-guidance
 node --test tests/distribution.test.mjs tests/maintain-guidance.test.mjs
-```
-
-Load the working tree directly in Claude Code:
-
-```bash
-claude --plugin-dir .
-```
-
-The test suite covers dormant hooks, explicit enablement, realistic Claude and Codex hook input, host detection, prompt gating, recursion protection, idempotent replacement, shell-safe text transport, secret rejection, malformed markers, concurrent writers, stale-lock diagnostics, BOM preservation, and CRLF preservation.
-
-## Project layout
-
-```text
-.agents/plugins/marketplace.json                 Codex marketplace
-.claude-plugin/marketplace.json                  Claude Code marketplace
-.codex-plugin/plugin.json                        Codex plugin manifest
-.claude-plugin/plugin.json                       Claude Code plugin manifest
-hooks/hooks.json                                 Shared lifecycle hooks
-skills/maintain-agent-guidance/SKILL.md          Skill instructions
-skills/maintain-agent-guidance/scripts/*.mjs     Deterministic updater
-tests/maintain-guidance.test.mjs                 Node.js test suite
+node skills/maintain-agent-guidance/scripts/maintain-guidance.mjs help
 ```
 
 ## License

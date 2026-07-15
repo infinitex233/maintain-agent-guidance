@@ -12,10 +12,11 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
-import { homedir } from "node:os";
 import { basename, dirname, join, parse, resolve } from "node:path";
 
 const ENABLED_MARKER = "<!-- maintain-agent-guidance:enabled -->";
+const ACTIVATION_START_MARKER = "<!-- maintain-agent-guidance:activation:start -->";
+const ACTIVATION_END_MARKER = "<!-- maintain-agent-guidance:activation:end -->";
 const START_MARKER = "<!-- maintain-agent-guidance:start -->";
 const END_MARKER = "<!-- maintain-agent-guidance:end -->";
 const BLOCK_TITLE = "## Maintained Agent Guidance";
@@ -30,10 +31,23 @@ const LOCK_RETRY_DELAY_MS = 25;
 const LOCK_STALE_MS = 30_000;
 const RENAME_RETRY_COUNT = 20;
 const RENAME_RETRY_DELAY_MS = 25;
+const MAX_GUIDANCE_LENGTH = 240;
+const MAX_GUIDANCE_ITEMS = 20;
+const MAX_MANAGED_BYTES = 4096;
+const MAX_BATCH_ITEMS = 2;
 
-const DURABLE_PROMPT = /(?:\b(?:always|never|must|remember|prefer|default to|from now on|going forward|do not|don't|avoid)\b|use\s+.+?\s+instead\s+of|以后|始终|总是|永远|必须|务必|不要|禁止|默认|记住|改用|优先|而不是|统一使用)/iu;
-const CORRECTION_PROMPT = /(?:\bnot\s+.+?\s+but\s+|\bcorrection\b|不(?:是|要).+而(?:是|要)|下次|以后别|应该改为)/iu;
-const DURABLE_ASSISTANT = /(?:only works (?:when|if)|fails unless|root cause (?:was|is)|must be run from|requires .+ before|always use|never use|do not use|只能在|否则会|根因(?:是|在于)|必须从|需要先|注意不要)/iu;
+const COMMAND_OPTIONS = new Map([
+  ["enable", new Set(["cwd", "host", "help"])],
+  ["repair", new Set(["cwd", "host", "help"])],
+  ["disable", new Set(["cwd", "host", "help"])],
+  ["status", new Set(["cwd", "host", "help"])],
+  ["apply", new Set(["cwd", "host", "category", "key", "evidence", "text", "text-base64", "help"])],
+  ["apply-batch", new Set(["cwd", "host", "items-base64", "help"])],
+  ["reconcile-batch", new Set(["cwd", "host", "operations-base64", "help"])],
+  ["remove", new Set(["cwd", "host", "key", "help"])],
+  ["help", new Set(["help"])],
+]);
+
 const SECRET_PATTERNS = [
   /\b(?:sk|rk)-[A-Za-z0-9_-]{16,}\b/,
   /\bgh[pousr]_[A-Za-z0-9]{20,}\b/,
@@ -61,15 +75,25 @@ function parseOptions(tokens) {
     const token = tokens[index];
     if (!token.startsWith("--")) fail(`Unexpected argument: ${token}`);
     const name = token.slice(2);
-    const value = tokens[index + 1];
-    if (value === undefined || value.startsWith("--")) {
+    if (Object.hasOwn(options, name)) fail(`Duplicate option: --${name}`);
+    if (name === "help") {
       options[name] = true;
-    } else {
-      options[name] = value;
-      index += 1;
+      continue;
     }
+    const value = tokens[index + 1];
+    if (value === undefined || value.startsWith("--")) fail(`Option --${name} requires a value.`);
+    options[name] = value;
+    index += 1;
   }
   return options;
+}
+
+function validateOptions(command, options) {
+  const allowed = COMMAND_OPTIONS.get(command);
+  if (!allowed) fail(`Unknown command: ${command}`);
+  for (const name of Object.keys(options)) {
+    if (!allowed.has(name)) fail(`Unknown option for ${command}: --${name}`);
+  }
 }
 
 function countOf(text, needle) {
@@ -80,19 +104,27 @@ function validateMarkers(content) {
   const starts = countOf(content, START_MARKER);
   const ends = countOf(content, END_MARKER);
   const enabled = countOf(content, ENABLED_MARKER);
+  const activationStarts = countOf(content, ACTIVATION_START_MARKER);
+  const activationEnds = countOf(content, ACTIVATION_END_MARKER);
   if (starts !== ends || starts > 1) {
     fail("Managed guidance markers are malformed; refusing to edit the file.");
   }
-  if (enabled > 1) {
-    fail("Enable markers are malformed; refusing to edit the file.");
+  if (enabled > 1 || activationStarts > 1 || activationEnds > 1 || activationStarts !== activationEnds) {
+    fail("Activation markers are malformed; refusing to edit the file.");
   }
   if (starts === 1 && content.indexOf(START_MARKER) > content.indexOf(END_MARKER)) {
     fail("Managed guidance markers are out of order; refusing to edit the file.");
+  }
+  if (activationStarts === 1 && content.indexOf(ACTIVATION_START_MARKER) > content.indexOf(ACTIVATION_END_MARKER)) {
+    fail("Activation markers are out of order; refusing to edit the file.");
   }
 }
 
 function findProjectRoot(cwd) {
   const start = resolve(cwd || process.cwd());
+  if (!existsSync(start) || !statSync(start).isDirectory()) {
+    fail(`Working directory does not exist or is not a directory: ${start}`);
+  }
   let current = start;
   while (true) {
     if (existsSync(join(current, ".git"))) return current;
@@ -102,24 +134,22 @@ function findProjectRoot(cwd) {
   }
 }
 
-function detectHost(options = {}, input = {}) {
-  const explicit = options.host || process.env.MAG_HOST;
-  if (explicit) {
-    const host = String(explicit).toLowerCase();
-    if (host !== "codex" && host !== "claude") fail(`Unsupported host: ${explicit}`);
-    return host;
-  }
-  if (process.env.PLUGIN_ROOT || process.env.PLUGIN_DATA) return "codex";
-  if (process.env.CLAUDE_PLUGIN_ROOT || process.env.CLAUDE_CODE_ENTRYPOINT) return "claude";
-  if (process.env.CODEX_THREAD_ID || input.turn_id || input.model) return "codex";
-  const cwd = resolve(options.cwd || input.cwd || process.cwd());
-  if (existsSync(join(cwd, "CLAUDE.md")) && !existsSync(join(cwd, "AGENTS.md"))) return "claude";
-  return "codex";
+function requireHost(options = {}) {
+  if (!options.host) fail("Option --host is required; use codex or claude.");
+  const host = String(options.host).toLowerCase();
+  if (host !== "codex" && host !== "claude") fail(`Unsupported host: ${options.host}`);
+  return host;
 }
 
-function targetPath(root, host, options = {}) {
-  if (options.target) return resolve(root, options.target);
+function targetPath(root, host) {
   return join(root, host === "claude" ? "CLAUDE.md" : "AGENTS.md");
+}
+
+function shadowingFile(root, host) {
+  if (host !== "codex") return null;
+  const override = join(root, "AGENTS.override.md");
+  if (!existsSync(override) || readText(override).text.trim().length === 0) return null;
+  return override;
 }
 
 function readText(file) {
@@ -173,7 +203,7 @@ function withLock(file, callback) {
   try {
     return callback();
   } finally {
-    if (handle !== undefined) closeSync(handle);
+    closeSync(handle);
     rmSync(lock, { force: true });
   }
 }
@@ -202,40 +232,52 @@ function mutateTextFile(file, transform) {
   });
 }
 
-function emptyBlock(eol) {
-  return [START_MARKER, BLOCK_TITLE, END_MARKER].join(eol);
+function activationBlock(eol, host) {
+  const invocation = host === "claude" ? "/maintain-agent-guidance" : "$maintain-agent-guidance";
+  return [
+    ACTIVATION_START_MARKER,
+    `> Before the final user-facing response for each top-level user task, invoke \`${invocation}\` exactly once. Subagents and delegated tasks must skip this pass. First inspect the current task for new durable repository guidance. If none qualifies, stop with zero tool calls and no file changes. Do not rerun project verification solely for this pass.`,
+    ACTIVATION_END_MARKER,
+  ].join(eol);
 }
 
-function enableContent(content, eol) {
+function removeSegment(content, eol, startMarker, endMarker) {
+  let start = content.indexOf(startMarker);
+  if (start < 0) return content;
+  let end = content.indexOf(endMarker, start) + endMarker.length;
+  if (content.slice(end, end + eol.length) === eol) end += eol.length;
+  else if (start >= eol.length && content.slice(start - eol.length, start) === eol) start -= eol.length;
+  return `${content.slice(0, start)}${content.slice(end)}`;
+}
+
+function removeMarkerLine(content, eol, marker) {
+  let start = content.indexOf(marker);
+  if (start < 0) return content;
+  let end = start + marker.length;
+  if (content.slice(end, end + eol.length) === eol) end += eol.length;
+  else if (start >= eol.length && content.slice(start - eol.length, start) === eol) start -= eol.length;
+  return `${content.slice(0, start)}${content.slice(end)}`;
+}
+
+function stripOwnedControl(content, eol, { managed = false } = {}) {
+  let next = removeSegment(content, eol, ACTIVATION_START_MARKER, ACTIVATION_END_MARKER);
+  if (managed) next = removeSegment(next, eol, START_MARKER, END_MARKER);
+  next = removeMarkerLine(next, eol, ENABLED_MARKER);
+  return next.replace(/^(?:\r?\n)+/u, "");
+}
+
+function enableContent(content, eol, host) {
   validateMarkers(content);
-  let next = content;
-  if (!next.includes(START_MARKER)) {
-    const separator = next.length === 0 ? "" : next.endsWith(eol) ? eol : `${eol}${eol}`;
-    next = `${next}${separator}${ENABLED_MARKER}${eol}${emptyBlock(eol)}${eol}`;
-  } else if (!next.includes(ENABLED_MARKER)) {
-    const start = next.indexOf(START_MARKER);
-    next = `${next.slice(0, start)}${ENABLED_MARKER}${eol}${next.slice(start)}`;
-  }
-  return next;
+  const items = parseManaged(content);
+  assertManagedLimits(items, eol);
+  const body = stripOwnedControl(content, eol, { managed: true });
+  const control = [ENABLED_MARKER, activationBlock(eol, host), renderManaged(items, eol)].join(eol);
+  return body.length > 0 ? `${control}${eol}${eol}${body}` : `${control}${eol}`;
 }
 
 function disableContent(content, eol) {
   validateMarkers(content);
-  const candidates = [`${ENABLED_MARKER}${eol}`, `${eol}${ENABLED_MARKER}`, ENABLED_MARKER];
-  let next = content;
-  for (const candidate of candidates) {
-    if (next.includes(candidate)) {
-      next = next.replace(candidate, candidate === `${eol}${ENABLED_MARKER}` ? "" : "");
-      break;
-    }
-  }
-  return next;
-}
-
-function isEnabled(file) {
-  const { text } = readText(file);
-  validateMarkers(text);
-  return text.includes(ENABLED_MARKER);
+  return stripOwnedControl(content, eol);
 }
 
 function normalizeText(value) {
@@ -244,7 +286,9 @@ function normalizeText(value) {
     .replace(/\s+/gu, " ")
     .trim();
   if (text.length < 4) fail("Guidance text is too short.");
-  if (text.length > 500) fail("Guidance text exceeds the 500 character limit.");
+  if (text.length > MAX_GUIDANCE_LENGTH) {
+    fail(`Guidance text exceeds the ${MAX_GUIDANCE_LENGTH} character limit.`);
+  }
   if (text.includes("<!--") || text.includes("-->")) fail("Guidance text cannot contain HTML comments.");
   if (SECRET_PATTERNS.some((pattern) => pattern.test(text))) {
     fail("Guidance text appears to contain a secret or credential.");
@@ -252,16 +296,22 @@ function normalizeText(value) {
   return text;
 }
 
-function guidanceText(options) {
-  if (options["text-base64"] === undefined) return options.text;
-  const encoded = options["text-base64"];
-  if (encoded === true || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(encoded)) {
-    fail("Guidance text base64 is invalid.");
+function decodeBase64(encoded, label) {
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(encoded || "")) {
+    fail(`${label} base64 is invalid.`);
   }
   const bytes = Buffer.from(encoded, "base64");
   const decoded = bytes.toString("utf8");
-  if (!Buffer.from(decoded, "utf8").equals(bytes)) fail("Guidance text is not valid UTF-8.");
+  if (!Buffer.from(decoded, "utf8").equals(bytes)) fail(`${label} is not valid UTF-8.`);
   return decoded;
+}
+
+function guidanceText(options) {
+  if (options.text !== undefined && options["text-base64"] !== undefined) {
+    fail("Use either --text or --text-base64, not both.");
+  }
+  if (options["text-base64"] === undefined) return options.text;
+  return decodeBase64(options["text-base64"], "Guidance text");
 }
 
 function normalizeKey(value, text) {
@@ -325,8 +375,38 @@ function renderManaged(items, eol) {
   return lines.join(eol);
 }
 
-function updateManaged(content, eol, candidate) {
-  const items = parseManaged(content);
+function itemCount(items) {
+  let count = 0;
+  for (const entries of items.values()) count += entries.length;
+  return count;
+}
+
+function assertManagedLimits(items, eol) {
+  const count = itemCount(items);
+  if (count > MAX_GUIDANCE_ITEMS) {
+    fail(`Managed guidance cannot exceed ${MAX_GUIDANCE_ITEMS} entries.`);
+  }
+  for (const entries of items.values()) {
+    for (const entry of entries) {
+      if (entry.text.length > MAX_GUIDANCE_LENGTH) {
+        fail(`Managed guidance contains an item over ${MAX_GUIDANCE_LENGTH} characters.`);
+      }
+    }
+  }
+  const bytes = Buffer.byteLength(renderManaged(items, eol), "utf8");
+  if (bytes > MAX_MANAGED_BYTES) {
+    fail(`Managed guidance cannot exceed ${MAX_MANAGED_BYTES} bytes.`);
+  }
+}
+
+function replaceManaged(content, rendered) {
+  const start = content.indexOf(START_MARKER);
+  const end = content.indexOf(END_MARKER) + END_MARKER.length;
+  if (start < 0 || end < END_MARKER.length) fail("Managed guidance block is missing.");
+  return `${content.slice(0, start)}${rendered}${content.slice(end)}`;
+}
+
+function upsertItems(items, candidate) {
   let existingLocation = null;
   let duplicate = null;
   for (const [category, entries] of items) {
@@ -337,79 +417,200 @@ function updateManaged(content, eol, candidate) {
     }
   }
   if (duplicate && duplicate.key !== candidate.key) {
-    return { content, changed: false, key: duplicate.key };
+    return { changed: false, key: duplicate.key };
   }
   if (existingLocation) {
     const old = items.get(existingLocation.category)[existingLocation.index];
     if (existingLocation.category === candidate.category && old.text === candidate.text) {
-      return { content, changed: false, key: candidate.key };
+      return { changed: false, key: candidate.key };
     }
     items.get(existingLocation.category).splice(existingLocation.index, 1);
   }
   items.get(candidate.category).push({ key: candidate.key, text: candidate.text });
+  return { changed: true, key: candidate.key };
+}
+
+function removeItem(items, key) {
+  for (const entries of items.values()) {
+    const index = entries.findIndex((entry) => entry.key === key);
+    if (index >= 0) {
+      entries.splice(index, 1);
+      return { changed: true, key };
+    }
+  }
+  return { changed: false, key };
+}
+
+function updateManaged(content, eol, candidate) {
+  const items = parseManaged(content);
+  const result = upsertItems(items, candidate);
+  if (!result.changed) return { content, ...result };
+  assertManagedLimits(items, eol);
   const rendered = renderManaged(items, eol);
-  const start = content.indexOf(START_MARKER);
-  const end = content.indexOf(END_MARKER) + END_MARKER.length;
-  if (start < 0 || end < END_MARKER.length) fail("Managed guidance block is missing.");
   return {
-    content: `${content.slice(0, start)}${rendered}${content.slice(end)}`,
-    changed: true,
-    key: candidate.key,
+    content: replaceManaged(content, rendered),
+    ...result,
   };
 }
 
-function dataDirectory(options = {}) {
-  return resolve(
-    options["data-dir"]
-      || process.env.MAG_DATA_DIR
-      || process.env.PLUGIN_DATA
-      || process.env.CLAUDE_PLUGIN_DATA
-      || join(homedir(), ".maintain-agent-guidance"),
-  );
+function removeManaged(content, eol, key) {
+  const items = parseManaged(content);
+  const result = removeItem(items, key);
+  if (!result.changed) return { content, ...result };
+  return { content: replaceManaged(content, renderManaged(items, eol)), ...result };
 }
 
-function stateFile(root, host, options = {}) {
-  const id = createHash("sha256").update(`${host}\0${resolve(root).toLowerCase()}`).digest("hex");
-  return join(dataDirectory(options), "repos", `${id}.json`);
+function reconcileManaged(content, eol, operations) {
+  const items = parseManaged(content);
+  const results = operations.map((operation) => {
+    if (operation.op === "remove") return { op: "remove", evidence: operation.evidence, ...removeItem(items, operation.key) };
+    return { op: "upsert", evidence: operation.evidence, ...upsertItems(items, operation) };
+  });
+  assertManagedLimits(items, eol);
+  if (!results.some((result) => result.changed)) return { content, changed: false, results };
+  const next = replaceManaged(content, renderManaged(items, eol));
+  return { content: next, changed: next !== content, results };
 }
 
-function readState(file) {
-  if (!existsSync(file)) return { schemaVersion: 1 };
+function candidateFromOptions(options) {
+  const category = String(options.category || "").toLowerCase();
+  if (!CATEGORIES.has(category)) fail("Category must be commands, conventions, or pitfalls.");
+  const evidence = String(options.evidence || "").toLowerCase();
+  if (!EVIDENCE.has(evidence)) fail("Evidence must be explicit, verified, or repeated.");
+  if (category === "commands" && evidence === "repeated") {
+    fail("Command evidence must be explicit or verified.");
+  }
+  const text = normalizeText(guidanceText(options));
+  if (!options.key) fail("Option --key is required.");
+  const key = normalizeKey(options.key, text);
+  return { category, evidence, key, text };
+}
+
+function batchCandidates(options) {
+  if (!options["items-base64"]) fail("Option --items-base64 is required.");
+  let items;
   try {
-    return JSON.parse(readFileSync(file, "utf8"));
-  } catch {
-    return { schemaVersion: 1 };
+    items = JSON.parse(decodeBase64(options["items-base64"], "Batch items"));
+  } catch (error) {
+    if (/base64|UTF-8/u.test(error.message)) throw error;
+    fail(`Batch items JSON is invalid: ${error.message}`);
+  }
+  if (!Array.isArray(items) || items.length === 0) fail("Batch items must be a non-empty array.");
+  if (items.length > MAX_BATCH_ITEMS) fail(`Apply at most ${MAX_BATCH_ITEMS} candidates per completion pass.`);
+  return items.map((item) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) fail("Each batch item must be an object.");
+    return candidateFromOptions(item);
+  });
+}
+
+function validateOperationFields(item, allowed, index) {
+  for (const name of Object.keys(item)) {
+    if (!allowed.has(name)) fail(`Unknown field in reconciliation operation ${index + 1}: ${name}`);
   }
 }
 
-function writeState(file, state) {
-  withLock(file, () => atomicWrite(file, `${JSON.stringify(state, null, 2)}\n`));
-}
-
-function promptCandidate(prompt) {
-  return DURABLE_PROMPT.test(prompt || "") || CORRECTION_PROMPT.test(prompt || "");
-}
-
-function assistantCandidate(message) {
-  return DURABLE_ASSISTANT.test(message || "");
-}
-
-async function readStdinJson() {
-  let input = "";
-  for await (const chunk of process.stdin) input += chunk;
-  if (!input.trim()) return {};
+function reconciliationOperations(options) {
+  if (!options["operations-base64"]) fail("Option --operations-base64 is required.");
+  let items;
   try {
-    return JSON.parse(input);
-  } catch {
-    fail("Hook input is not valid JSON.");
+    items = JSON.parse(decodeBase64(options["operations-base64"], "Reconciliation operations"));
+  } catch (error) {
+    if (/base64|UTF-8/u.test(error.message)) throw error;
+    fail(`Reconciliation operations JSON is invalid: ${error.message}`);
   }
+  if (!Array.isArray(items) || items.length === 0) {
+    fail("Reconciliation operations must be a non-empty array.");
+  }
+  if (items.length > MAX_BATCH_ITEMS) {
+    fail(`Reconcile at most ${MAX_BATCH_ITEMS} operations per completion pass.`);
+  }
+  const seenKeys = new Set();
+  return items.map((item, index) => {
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      fail("Each reconciliation operation must be an object.");
+    }
+    const op = String(item.op || "").toLowerCase();
+    let operation;
+    if (op === "upsert") {
+      validateOperationFields(item, new Set(["op", "category", "key", "evidence", "text", "text-base64"]), index);
+      operation = { op, ...candidateFromOptions(item) };
+    } else if (op === "remove") {
+      validateOperationFields(item, new Set(["op", "key", "evidence"]), index);
+      if (!item.key) fail("A remove operation requires a key.");
+      const evidence = String(item.evidence || "").toLowerCase();
+      if (evidence !== "explicit" && evidence !== "verified") {
+        fail("Remove evidence must be explicit or verified.");
+      }
+      operation = { op, key: normalizeKey(item.key, "unused"), evidence };
+    } else {
+      fail(`Operation ${index + 1} must use op upsert or remove.`);
+    }
+    if (seenKeys.has(operation.key)) fail(`Duplicate reconciliation key: ${operation.key}`);
+    seenKeys.add(operation.key);
+    return operation;
+  });
 }
 
-function commandContext(options, input = {}) {
-  const root = findProjectRoot(options.cwd || input.cwd || process.cwd());
-  const host = detectHost(options, input);
-  const target = targetPath(root, host, options);
+function commandContext(options) {
+  const root = findProjectRoot(options.cwd || process.cwd());
+  const host = requireHost(options);
+  const target = targetPath(root, host);
   return { root, host, target };
+}
+
+function inspectContent(content, eol, host) {
+  try {
+    validateMarkers(content);
+  } catch (error) {
+    return { state: "broken", enabled: false, reason: error.message };
+  }
+  const enabled = countOf(content, ENABLED_MARKER);
+  const activationStarts = countOf(content, ACTIVATION_START_MARKER);
+  const activationEnds = countOf(content, ACTIVATION_END_MARKER);
+  const managedStarts = countOf(content, START_MARKER);
+  const managedEnds = countOf(content, END_MARKER);
+  if (enabled === 0 && activationStarts === 0 && activationEnds === 0) {
+    return { state: "disabled", enabled: false };
+  }
+  if (enabled !== 1 || activationStarts !== 1 || activationEnds !== 1 || managedStarts !== 1 || managedEnds !== 1) {
+    return { state: "broken", enabled: false, reason: "Owned control markers are incomplete." };
+  }
+  const expectedPrefix = `${ENABLED_MARKER}${eol}${activationBlock(eol, host)}${eol}${START_MARKER}`;
+  if (!content.startsWith(expectedPrefix)) {
+    return { state: "broken", enabled: false, reason: "Owned control block is not canonical." };
+  }
+  try {
+    const items = parseManaged(content);
+    assertManagedLimits(items, eol);
+    return {
+      state: "active",
+      enabled: true,
+      entries: itemCount(items),
+      managedBytes: Buffer.byteLength(renderManaged(items, eol), "utf8"),
+    };
+  } catch (error) {
+    return { state: "broken", enabled: false, reason: error.message };
+  }
+}
+
+function inspectContext(context) {
+  const shadowedBy = shadowingFile(context.root, context.host);
+  if (shadowedBy) return { state: "shadowed", enabled: false, shadowedBy };
+  if (!existsSync(context.target)) return { state: "disabled", enabled: false };
+  const current = readText(context.target);
+  return inspectContent(current.text, current.eol, context.host);
+}
+
+function ensureWritableHost(context) {
+  const shadowedBy = shadowingFile(context.root, context.host);
+  if (shadowedBy) fail(`${context.target} is shadowed by ${shadowedBy}.`);
+}
+
+function ensureActiveContent(content, eol, context) {
+  const inspection = inspectContent(content, eol, context.host);
+  if (inspection.state !== "active") {
+    fail(`Guidance maintenance is not active for ${context.target}: ${inspection.state}.`);
+  }
 }
 
 function output(value) {
@@ -418,135 +619,141 @@ function output(value) {
 
 function enable(options) {
   const context = commandContext(options);
-  const changed = mutateTextFile(context.target, enableContent);
-  output({ ...context, enabled: true, changed });
+  ensureWritableHost(context);
+  const changed = mutateTextFile(context.target, (content, eol) => {
+    const inspection = inspectContent(content, eol, context.host);
+    if (inspection.state === "active") return content;
+    if (inspection.state !== "disabled") {
+      fail(`Cannot enable guidance from ${inspection.state} state; run repair explicitly.`);
+    }
+    return enableContent(content, eol, context.host);
+  });
+  output({ ...context, state: "active", enabled: true, changed });
+}
+
+function repair(options) {
+  const context = commandContext(options);
+  ensureWritableHost(context);
+  const changed = mutateTextFile(context.target, (content, eol) => {
+    const inspection = inspectContent(content, eol, context.host);
+    if (inspection.state === "active") return content;
+    if (inspection.state !== "broken") {
+      fail(`Cannot repair guidance from ${inspection.state} state; run enable for disabled maintenance.`);
+    }
+    return enableContent(content, eol, context.host);
+  });
+  output({ ...context, state: "active", enabled: true, changed });
 }
 
 function disable(options) {
   const context = commandContext(options);
   if (!existsSync(context.target)) {
-    output({ ...context, enabled: false, changed: false });
+    output({ ...context, state: "disabled", enabled: false, changed: false });
     return;
   }
   const changed = mutateTextFile(context.target, disableContent);
-  output({ ...context, enabled: false, changed });
+  output({ ...context, state: "disabled", enabled: false, changed });
 }
 
 function status(options) {
   const context = commandContext(options);
-  output({ ...context, enabled: existsSync(context.target) && isEnabled(context.target) });
+  output({ ...context, ...inspectContext(context) });
 }
 
 function apply(options) {
   const context = commandContext(options);
-  if (!existsSync(context.target) || !isEnabled(context.target)) {
-    fail(`Guidance maintenance is not enabled for ${context.target}.`);
-  }
-  const category = String(options.category || "").toLowerCase();
-  if (!CATEGORIES.has(category)) fail("Category must be commands, conventions, or pitfalls.");
-  const evidence = String(options.evidence || "").toLowerCase();
-  if (!EVIDENCE.has(evidence)) fail("Evidence must be explicit, verified, or repeated.");
-  const text = normalizeText(guidanceText(options));
-  const key = normalizeKey(options.key, text);
+  ensureWritableHost(context);
+  const candidate = candidateFromOptions(options);
   let result;
   const changed = mutateTextFile(context.target, (content, eol) => {
-    result = updateManaged(content, eol, { category, evidence, key, text });
+    ensureActiveContent(content, eol, context);
+    result = updateManaged(content, eol, candidate);
     return result.content;
   });
-  output({ ...context, category, evidence, key: result.key, changed });
+  output({ ...context, category: candidate.category, evidence: candidate.evidence, key: result.key, changed });
 }
 
-async function hook(options) {
-  const input = await readStdinJson();
-  const context = commandContext(options, input);
-  if (!existsSync(context.target) || !isEnabled(context.target)) return;
-
-  const file = stateFile(context.root, context.host, options);
-  const state = readState(file);
-  const event = input.hook_event_name;
-  const eventTurnId = input.turn_id || input.prompt_id;
-  const synthesizedTurnId = !eventTurnId && event === "UserPromptSubmit";
-  let turnId = eventTurnId;
-  if (synthesizedTurnId) {
-    const previousSequence = Number.isSafeInteger(state.turnSequence) ? state.turnSequence : 0;
-    state.turnSequence = previousSequence + 1;
-    turnId = `${input.session_id || "unknown"}:turn-${state.turnSequence}`;
-  }
-  turnId ||= state.currentTurnId || input.session_id || "unknown";
-
-  if (event === "UserPromptSubmit") {
-    const candidate = promptCandidate(input.prompt);
-    if (!candidate) {
-      let changed = false;
-      if (synthesizedTurnId) {
-        state.currentTurnId = turnId;
-        changed = true;
-      }
-      if (state.pendingTurnId && state.pendingTurnId !== turnId) {
-        delete state.pendingTurnId;
-        delete state.pendingCandidate;
-        delete state.promptHash;
-        changed = true;
-      }
-      if (changed) writeState(file, state);
-      return;
+function applyBatch(options) {
+  const context = commandContext(options);
+  ensureWritableHost(context);
+  const candidates = batchCandidates(options);
+  const results = [];
+  const changed = mutateTextFile(context.target, (content, eol) => {
+    ensureActiveContent(content, eol, context);
+    let next = content;
+    for (const candidate of candidates) {
+      const result = updateManaged(next, eol, candidate);
+      results.push({
+        category: candidate.category,
+        evidence: candidate.evidence,
+        key: result.key,
+        changed: result.changed,
+      });
+      next = result.content;
     }
-    state.currentTurnId = turnId;
-    state.pendingTurnId = turnId;
-    state.pendingCandidate = true;
-    state.promptHash = createHash("sha256").update(String(input.prompt || "")).digest("hex");
-    writeState(file, state);
-    return;
-  }
-
-  if (event !== "Stop") return;
-  if (input.stop_hook_active) {
-    delete state.pendingTurnId;
-    delete state.pendingCandidate;
-    delete state.promptHash;
-    state.lastProcessedTurnId = turnId;
-    writeState(file, state);
-    return;
-  }
-  const hasBackgroundWork = Array.isArray(input.background_tasks)
-    && input.background_tasks.some((task) => !["completed", "failed", "cancelled"].includes(task.status));
-  if (hasBackgroundWork) return;
-  if (state.lastAttemptedTurnId === turnId) return;
-
-  const pendingMatches = state.pendingCandidate
-    && (!state.pendingTurnId || state.pendingTurnId === turnId);
-  const candidate = process.env.MAG_FORCE_CANDIDATE === "1"
-    || pendingMatches
-    || assistantCandidate(input.last_assistant_message);
-  if (!candidate) return;
-
-  state.lastAttemptedTurnId = turnId;
-  writeState(file, state);
-  output({
-    decision: "block",
-    reason: "Use the maintain-agent-guidance skill now for this completed turn. The repository is already enabled. Persist only durable, verified guidance; make no change when there is none. Do not repeat the user's answer or rerun project verification.",
+    return next;
   });
+  output({ ...context, changed, results });
+}
+
+function reconcileBatch(options) {
+  const context = commandContext(options);
+  ensureWritableHost(context);
+  const operations = reconciliationOperations(options);
+  let result;
+  const changed = mutateTextFile(context.target, (content, eol) => {
+    ensureActiveContent(content, eol, context);
+    result = reconcileManaged(content, eol, operations);
+    return result.content;
+  });
+  output({ ...context, changed, results: result.results });
+}
+
+function remove(options) {
+  const context = commandContext(options);
+  if (!options.key) fail("Option --key is required.");
+  const key = normalizeKey(options.key, "unused");
+  if (!existsSync(context.target)) {
+    output({ ...context, key, changed: false });
+    return;
+  }
+  let result;
+  const changed = mutateTextFile(context.target, (content, eol) => {
+    result = removeManaged(content, eol, key);
+    return result.content;
+  });
+  output({ ...context, key, changed });
 }
 
 function help() {
-  process.stdout.write(`maintain-guidance commands:\n\n`);
-  process.stdout.write(`  enable  --host codex|claude [--cwd PATH] [--target PATH]\n`);
-  process.stdout.write(`  disable --host codex|claude [--cwd PATH] [--target PATH]\n`);
-  process.stdout.write(`  status  --host codex|claude [--cwd PATH] [--target PATH]\n`);
-  process.stdout.write(`  apply   --host HOST --category CATEGORY --key KEY --evidence TYPE (--text TEXT | --text-base64 BASE64)\n`);
-  process.stdout.write(`  hook    # reads lifecycle JSON from stdin\n`);
+  process.stdout.write("maintain-guidance commands:\n\n");
+  process.stdout.write("  enable      --host codex|claude [--cwd PATH]\n");
+  process.stdout.write("  repair      --host codex|claude [--cwd PATH]\n");
+  process.stdout.write("  disable     --host codex|claude [--cwd PATH]\n");
+  process.stdout.write("  status      --host codex|claude [--cwd PATH]\n");
+  process.stdout.write("  apply       --host HOST --category CATEGORY --key KEY --evidence TYPE (--text TEXT | --text-base64 BASE64)\n");
+  process.stdout.write("  apply-batch --host HOST --items-base64 BASE64_JSON [--cwd PATH]\n");
+  process.stdout.write("  reconcile-batch --host HOST --operations-base64 BASE64_JSON [--cwd PATH]\n");
+  process.stdout.write("  remove      --host HOST --key KEY [--cwd PATH]\n");
+  process.stdout.write("\nreconcile-batch JSON operations (maximum 2):\n");
+  process.stdout.write('  {"op":"upsert","category":"conventions","key":"stable-key","evidence":"explicit","text":"Durable guidance."}\n');
+  process.stdout.write('  {"op":"remove","key":"stable-key","evidence":"explicit"}\n');
 }
 
 async function main() {
   const command = process.argv[2];
   const options = parseOptions(process.argv.slice(3));
-  if (!command || command === "help" || options.help) return help();
+  if (!command) return help();
+  validateOptions(command, options);
+  if (command === "help" || options.help) return help();
   if (command === "enable") return enable(options);
+  if (command === "repair") return repair(options);
   if (command === "disable") return disable(options);
   if (command === "status") return status(options);
   if (command === "apply") return apply(options);
-  if (command === "hook") return hook(options);
-  fail(`Unknown command: ${command}`);
+  if (command === "apply-batch") return applyBatch(options);
+  if (command === "reconcile-batch") return reconcileBatch(options);
+  if (command === "remove") return remove(options);
 }
 
 main().catch((error) => {
