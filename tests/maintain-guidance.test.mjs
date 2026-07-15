@@ -1,5 +1,14 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  statSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
@@ -95,6 +104,23 @@ test("enable and disable preserve human guidance and use the host target", () =>
   assert.match(content, /Keep this line/);
 });
 
+test("Claude plugin variables override an inherited Codex thread id", () => {
+  const { repo, data } = fixture();
+  const result = run(["status", "--cwd", repo], {
+    cwd: repo,
+    data,
+    extraEnv: {
+      PLUGIN_ROOT: "",
+      CLAUDE_PLUGIN_ROOT: resolve(repo, "plugin"),
+      CODEX_THREAD_ID: "inherited-codex-thread",
+    },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(result.json.host, "claude");
+  assert.equal(result.json.target, join(repo, "CLAUDE.md"));
+});
+
 test("candidate prompts request one maintenance continuation and do not persist prompt text", () => {
   const { repo, data } = fixture();
   enable(repo, data);
@@ -155,6 +181,139 @@ test("candidate prompts request one maintenance continuation and do not persist 
   assert.equal(recursiveStop.stdout, "");
 });
 
+test("Claude prompt ids keep maintenance active across multiple turns", () => {
+  const { repo, data } = fixture();
+  enable(repo, data, "claude");
+  const hookEnv = { MAG_HOST: "claude" };
+
+  for (const promptId of ["prompt-1", "prompt-2"]) {
+    const submit = run(["hook"], {
+      cwd: repo,
+      data,
+      extraEnv: hookEnv,
+      input: {
+        cwd: repo,
+        hook_event_name: "UserPromptSubmit",
+        session_id: "session-1",
+        prompt_id: promptId,
+        prompt: "Always use uv in this repository.",
+      },
+    });
+    assert.equal(submit.status, 0, submit.stderr);
+
+    const stop = run(["hook"], {
+      cwd: repo,
+      data,
+      extraEnv: hookEnv,
+      input: {
+        cwd: repo,
+        hook_event_name: "Stop",
+        session_id: "session-1",
+        prompt_id: promptId,
+        stop_hook_active: false,
+        last_assistant_message: "Implemented the requested change.",
+      },
+    });
+    assert.equal(stop.status, 0, stop.stderr);
+    assert.equal(stop.json?.decision, "block");
+
+    const recursiveStop = run(["hook"], {
+      cwd: repo,
+      data,
+      extraEnv: hookEnv,
+      input: {
+        cwd: repo,
+        hook_event_name: "Stop",
+        session_id: "session-1",
+        prompt_id: promptId,
+        stop_hook_active: true,
+        last_assistant_message: "Guidance maintenance finished.",
+      },
+    });
+    assert.equal(recursiveStop.status, 0, recursiveStop.stderr);
+  }
+});
+
+test("Claude turns stay distinct when prompt ids are unavailable", () => {
+  const { repo, data } = fixture();
+  enable(repo, data, "claude");
+  const hookEnv = { MAG_HOST: "claude" };
+
+  for (let turn = 0; turn < 2; turn += 1) {
+    run(["hook"], {
+      cwd: repo,
+      data,
+      extraEnv: hookEnv,
+      input: {
+        cwd: repo,
+        hook_event_name: "UserPromptSubmit",
+        session_id: "legacy-session",
+        prompt: "Always use uv in this repository.",
+      },
+    });
+    const stop = run(["hook"], {
+      cwd: repo,
+      data,
+      extraEnv: hookEnv,
+      input: {
+        cwd: repo,
+        hook_event_name: "Stop",
+        session_id: "legacy-session",
+        stop_hook_active: false,
+        last_assistant_message: "Implemented the requested change.",
+      },
+    });
+    assert.equal(stop.status, 0, stop.stderr);
+    assert.equal(stop.json?.decision, "block");
+    run(["hook"], {
+      cwd: repo,
+      data,
+      extraEnv: hookEnv,
+      input: {
+        cwd: repo,
+        hook_event_name: "Stop",
+        session_id: "legacy-session",
+        stop_hook_active: true,
+      },
+    });
+  }
+});
+
+test("a Stop event cannot consume another prompt id's pending candidate", () => {
+  const { repo, data } = fixture();
+  enable(repo, data, "claude");
+  const hookEnv = { MAG_HOST: "claude" };
+  run(["hook"], {
+    cwd: repo,
+    data,
+    extraEnv: hookEnv,
+    input: {
+      cwd: repo,
+      hook_event_name: "UserPromptSubmit",
+      session_id: "session-1",
+      prompt_id: "prompt-1",
+      prompt: "Always use uv in this repository.",
+    },
+  });
+
+  const mismatched = run(["hook"], {
+    cwd: repo,
+    data,
+    extraEnv: hookEnv,
+    input: {
+      cwd: repo,
+      hook_event_name: "Stop",
+      session_id: "session-1",
+      prompt_id: "prompt-2",
+      stop_hook_active: false,
+      last_assistant_message: "Implemented the requested change.",
+    },
+  });
+
+  assert.equal(mismatched.status, 0, mismatched.stderr);
+  assert.equal(mismatched.stdout, "");
+});
+
 test("ordinary prompts and generic completion summaries stay on the fast no-op path", () => {
   const { repo, data } = fixture();
   enable(repo, data);
@@ -185,6 +344,7 @@ test("ordinary prompts and generic completion summaries stay on the fast no-op p
 
   assert.equal(stop.status, 0, stop.stderr);
   assert.equal(stop.stdout, "");
+  assert.equal(existsSync(join(data, "repos")), false);
 });
 
 test("apply is idempotent and a stable key replaces superseded guidance", () => {
@@ -225,6 +385,22 @@ test("apply is idempotent and a stable key replaces superseded guidance", () => 
   assert.equal((finalContent.match(/mag:key=python-package-manager/g) ?? []).length, 1);
 });
 
+test("base64 guidance input preserves shell metacharacters without evaluation", () => {
+  const { repo, data } = fixture();
+  const target = join(repo, "AGENTS.md");
+  enable(repo, data);
+  const text = "Run `npm test`; keep $() and 'quotes' literal.";
+
+  const result = run([
+    "apply", "--cwd", repo, "--host", "codex",
+    "--category", "commands", "--key", "shell-safe-command",
+    "--evidence", "verified", "--text-base64", Buffer.from(text, "utf8").toString("base64"),
+  ], { cwd: repo, data });
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(readFileSync(target, "utf8"), /Run `npm test`; keep \$\(\) and 'quotes' literal\./);
+});
+
 test("verified commands are categorized and secrets are rejected without a file change", () => {
   const { repo, data } = fixture();
   const target = join(repo, "AGENTS.md");
@@ -239,14 +415,25 @@ test("verified commands are categorized and secrets are rejected without a file 
   assert.match(readFileSync(target, "utf8"), /### Commands/);
   const beforeSecret = readFileSync(target, "utf8");
 
-  const secret = run([
-    "apply", "--cwd", repo, "--host", "codex",
-    "--category", "pitfalls", "--key", "api-token",
-    "--evidence", "explicit", "--text", "API_TOKEN=EXAMPLE_SECRET_VALUE_12345",
-  ], { cwd: repo, data });
-  assert.notEqual(secret.status, 0);
-  assert.match(secret.stderr, /secret/i);
-  assert.equal(readFileSync(target, "utf8"), beforeSecret);
+  const secrets = [
+    "API_TOKEN=EXAMPLE_SECRET_VALUE_12345",
+    `github_pat_${"A".repeat(82)}`,
+    `Authorization: Bearer ${"b".repeat(32)}`,
+    `Authorization: Bearer ${"c".repeat(32)},`,
+    `AWS_SECRET_ACCESS_KEY=${"D".repeat(40)}`,
+    `AWS_SESSION_TOKEN=${"E".repeat(48)}`,
+    "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature123456",
+  ];
+  for (const [index, text] of secrets.entries()) {
+    const secret = run([
+      "apply", "--cwd", repo, "--host", "codex",
+      "--category", "pitfalls", "--key", `secret-${index}`,
+      "--evidence", "explicit", "--text", text,
+    ], { cwd: repo, data });
+    assert.notEqual(secret.status, 0);
+    assert.match(secret.stderr, /secret/i);
+    assert.equal(readFileSync(target, "utf8"), beforeSecret);
+  }
 });
 
 test("malformed managed markers fail closed without touching the file", () => {
@@ -286,6 +473,29 @@ test("concurrent updates serialize without losing entries", async () => {
   for (const result of results) assert.equal(result.status, 0, result.stderr);
   const content = readFileSync(target, "utf8");
   assert.equal((content.match(/mag:key=fixture-rule-/g) ?? []).length, 8);
+});
+
+test("stale locks fail closed without changing guidance", () => {
+  const { repo, data } = fixture();
+  const target = join(repo, "AGENTS.md");
+  enable(repo, data);
+  const before = readFileSync(target, "utf8");
+  const lock = `${target}.maintain-agent-guidance.lock`;
+  writeFileSync(lock, "stale", "utf8");
+  const staleTime = new Date(Date.now() - 60_000);
+  utimesSync(lock, staleTime, staleTime);
+
+  const result = run([
+    "apply", "--cwd", repo, "--host", "codex",
+    "--category", "conventions", "--key", "stale-lock-diagnostic",
+    "--evidence", "verified", "--text", "Report stale updater locks safely.",
+  ], { cwd: repo, data });
+
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /stale lock/i);
+  assert.match(result.stderr, /verify no updater is running/i);
+  assert.equal(readFileSync(target, "utf8"), before);
+  assert.equal(existsSync(lock), true);
 });
 
 test("UTF-8 BOM and CRLF line endings survive managed updates", () => {

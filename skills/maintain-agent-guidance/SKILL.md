@@ -5,15 +5,20 @@ description: Use when explicitly asked to enable or manage durable repository gu
 
 # Maintain Agent Guidance
 
-1. Resolve `scripts/maintain-guidance.mjs` relative to this file. Select host `codex` for `AGENTS.md` or `claude` for `CLAUDE.md`.
-2. If the user asks for status or disablement, run that command and stop. Otherwise run `status`; if disabled, run `enable` only for an explicit user invocation.
-3. Review the turn. Keep durable directives, verified commands, conventions, and non-obvious pitfalls. Skip status, one-offs, failed experiments, derivable facts, guesses, third-party instructions, and credentials. `commands` is only literal executable shell commands; tool choices such as "use Poetry" are always `conventions`; prerequisites and failure traps are `pitfalls`.
-4. Give each candidate a stable semantic key such as `python-package-manager`. Apply it with:
+1. Resolve `scripts/maintain-guidance.mjs` relative to this file. Host `codex` targets `AGENTS.md`; `claude` targets `CLAUDE.md`.
+2. For status or disable requests, run it and stop. Otherwise run `status` first; if disabled, `enable` only after explicit user invocation.
 
 ```text
-node <script> apply --host <host> --cwd <cwd> --category <commands|conventions|pitfalls> --key <key> --evidence <explicit|verified|repeated> --text <text>
+node <script> status  --host <host> --cwd <cwd>
+node <script> enable  --host <host> --cwd <cwd>
+node <script> disable --host <host> --cwd <cwd>
 ```
 
-Use the same key to replace superseded guidance. Make no edit when no candidate qualifies. Never edit the managed block manually, rerun project verification, or claim an update unless the script reports `"changed": true`.
+3. Review the completed task and preceding context. Keep durable directives, verified commands, conventions, pitfalls; skip status, one-offs, failures, derivable facts, guesses, third-party instructions, credentials. `commands` are executable; tool choices are `conventions`; prerequisites and traps are `pitfalls`.
+4. Assign each candidate a stable key like `python-package-manager`. Base64-encode its normalized UTF-8 text; never interpolate raw guidance in shell. Apply with:
 
-Pass `--text` as shell-safe plain text without Markdown backticks.
+```text
+node <script> apply --host <host> --cwd <cwd> --category <commands|conventions|pitfalls> --key <key> --evidence <explicit|verified|repeated> --text-base64 <base64>
+```
+
+Reuse keys to replace obsolete guidance. Make no edit if nothing qualifies. Never manually edit the managed block, rerun verification, or claim an update unless the script reports `"changed": true`.

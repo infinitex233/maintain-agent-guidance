@@ -104,9 +104,9 @@ Disabling removes the hidden enabled marker. It keeps previously maintained guid
 
 ## Safety and file behavior
 
-- Raw user prompts are never stored. The temporary hook state contains only a candidate flag and a SHA-256 hash.
-- Common token, password, API key, private key, and credential patterns are rejected before writing.
-- Updates use a lock and an atomic file replacement.
+- Raw user prompts are never stored. Temporary hook state contains only lifecycle identifiers and counters, a candidate flag, and a SHA-256 hash.
+- Common GitHub, GitLab, npm, AWS, Google, Slack, Bearer, JWT, password, private key, and credential patterns are rejected before writing.
+- Updates use a fail-closed lock and an atomic file replacement; stale locks report an actionable path instead of risking concurrent writes.
 - UTF-8 BOM, CRLF line endings, file permissions, and human-authored content are preserved.
 - `stop_hook_active` prevents recursive maintenance loops.
 - Subagent stop events do not write guidance directly, which avoids concurrent duplicate updates.
@@ -127,7 +127,7 @@ Load the working tree directly in Claude Code:
 claude --plugin-dir .
 ```
 
-The test suite covers dormant hooks, explicit enablement, prompt gating, recursion protection, idempotent replacement, secret rejection, malformed markers, concurrent writers, BOM preservation, and CRLF preservation.
+The test suite covers dormant hooks, explicit enablement, realistic Claude and Codex hook input, host detection, prompt gating, recursion protection, idempotent replacement, shell-safe text transport, secret rejection, malformed markers, concurrent writers, stale-lock diagnostics, BOM preservation, and CRLF preservation.
 
 ## Project layout
 

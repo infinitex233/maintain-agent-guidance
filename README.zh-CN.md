@@ -104,9 +104,9 @@ Use maintain-agent-guidance to disable maintenance in this repository.
 
 ## 安全与文件处理
 
-- 不会保存用户原始提示词。临时 hook 状态只包含候选标志和 SHA-256 哈希。
-- 写入前会拒绝常见 token、密码、API key、私钥和凭据格式。
-- 使用文件锁和原子替换执行更新。
+- 不会保存用户原始提示词。临时 hook 状态只包含生命周期标识与计数器、候选标志和 SHA-256 哈希。
+- 写入前会拒绝常见 GitHub、GitLab、npm、AWS、Google、Slack、Bearer、JWT、密码、私钥和凭据格式。
+- 使用失败关闭文件锁和原子替换执行更新；陈旧锁会报告可操作的路径，而不会冒险并发写入。
 - 保留 UTF-8 BOM、CRLF 换行、文件权限以及用户手写内容。
 - 使用 `stop_hook_active` 防止维护流程递归触发。
 - 不直接在 subagent stop 事件中写入，避免并发重复更新。
@@ -127,7 +127,7 @@ node --test tests/distribution.test.mjs tests/maintain-guidance.test.mjs
 claude --plugin-dir .
 ```
 
-测试覆盖 hook 休眠、显式启用、提示门控、递归保护、幂等替换、秘密信息拒绝、损坏标记、并发写入、BOM 保留和 CRLF 保留。
+测试覆盖 hook 休眠、显式启用、真实 Claude/Codex hook 输入、宿主识别、提示门控、递归保护、幂等替换、shell 安全文本传输、秘密信息拒绝、损坏标记、并发写入、陈旧锁诊断、BOM 保留和 CRLF 保留。
 
 ## 项目结构
 

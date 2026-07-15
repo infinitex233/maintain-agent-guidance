@@ -25,6 +25,9 @@ const CATEGORIES = new Map([
   ["pitfalls", "Pitfalls"],
 ]);
 const EVIDENCE = new Set(["explicit", "verified", "repeated"]);
+const LOCK_RETRY_COUNT = 40;
+const LOCK_RETRY_DELAY_MS = 25;
+const LOCK_STALE_MS = 30_000;
 
 const DURABLE_PROMPT = /(?:\b(?:always|never|must|remember|prefer|default to|from now on|going forward|do not|don't|avoid)\b|use\s+.+?\s+instead\s+of|以后|始终|总是|永远|必须|务必|不要|禁止|默认|记住|改用|优先|而不是|统一使用)/iu;
 const CORRECTION_PROMPT = /(?:\bnot\s+.+?\s+but\s+|\bcorrection\b|不(?:是|要).+而(?:是|要)|下次|以后别|应该改为)/iu;
@@ -32,8 +35,15 @@ const DURABLE_ASSISTANT = /(?:only works (?:when|if)|fails unless|root cause (?:
 const SECRET_PATTERNS = [
   /\b(?:sk|rk)-[A-Za-z0-9_-]{16,}\b/,
   /\bgh[pousr]_[A-Za-z0-9]{20,}\b/,
+  /\bgithub_pat_[A-Za-z0-9_]{20,}\b/,
+  /\bglpat-[A-Za-z0-9_-]{20,}\b/,
+  /\bnpm_[A-Za-z0-9]{20,}\b/,
   /\bAKIA[0-9A-Z]{16}\b/,
+  /\bAWS_(?:ACCESS_KEY_ID|SECRET_ACCESS_KEY|SESSION_TOKEN)\s*[:=]\s*["']?[A-Za-z0-9/+=]{16,}/iu,
+  /\bAIza[0-9A-Za-z_-]{20,}\b/,
   /\bxox[baprs]-[A-Za-z0-9-]{12,}\b/,
+  /\bBearer\s+[A-Za-z0-9._~+/=-]{16,}(?=$|[\s,;:)}\]"'])/iu,
+  /\beyJ[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\b/,
   /-----BEGIN [A-Z ]*PRIVATE KEY-----/,
   /(?:password|passwd|secret|token|api[_ -]?key)\s*[:=]\s*["']?[^\s"']{8,}/iu,
   /https?:\/\/[^/\s:@]+:[^@\s/]+@/iu,
@@ -97,8 +107,9 @@ function detectHost(options = {}, input = {}) {
     if (host !== "codex" && host !== "claude") fail(`Unsupported host: ${explicit}`);
     return host;
   }
-  if (process.env.PLUGIN_ROOT || process.env.CODEX_THREAD_ID || input.model) return "codex";
+  if (process.env.PLUGIN_ROOT || process.env.PLUGIN_DATA) return "codex";
   if (process.env.CLAUDE_PLUGIN_ROOT || process.env.CLAUDE_CODE_ENTRYPOINT) return "claude";
+  if (process.env.CODEX_THREAD_ID || input.turn_id || input.model) return "codex";
   const cwd = resolve(options.cwd || input.cwd || process.cwd());
   if (existsSync(join(cwd, "CLAUDE.md")) && !existsSync(join(cwd, "AGENTS.md"))) return "claude";
   return "codex";
@@ -125,15 +136,25 @@ function withLock(file, callback) {
   mkdirSync(dirname(file), { recursive: true });
   const lock = `${file}.maintain-agent-guidance.lock`;
   let handle;
-  for (let attempt = 0; attempt < 40; attempt += 1) {
+  for (let attempt = 0; attempt < LOCK_RETRY_COUNT; attempt += 1) {
     try {
       handle = openSync(lock, "wx", 0o600);
       break;
     } catch (error) {
-      if (error.code !== "EEXIST" || attempt === 39) throw error;
-      sleep(25);
+      if (error.code !== "EEXIST") throw error;
+      try {
+        if (Date.now() - statSync(lock).mtimeMs >= LOCK_STALE_MS) {
+          fail(`Stale lock detected at ${lock}; verify no updater is running, then remove it.`);
+        }
+      } catch (statError) {
+        if (statError.code === "ENOENT") continue;
+        throw statError;
+      }
+      if (attempt === LOCK_RETRY_COUNT - 1) throw error;
+      sleep(LOCK_RETRY_DELAY_MS);
     }
   }
+  if (handle === undefined) fail(`Unable to acquire lock for ${file}.`);
   try {
     return callback();
   } finally {
@@ -214,6 +235,18 @@ function normalizeText(value) {
     fail("Guidance text appears to contain a secret or credential.");
   }
   return text;
+}
+
+function guidanceText(options) {
+  if (options["text-base64"] === undefined) return options.text;
+  const encoded = options["text-base64"];
+  if (encoded === true || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/u.test(encoded)) {
+    fail("Guidance text base64 is invalid.");
+  }
+  const bytes = Buffer.from(encoded, "base64");
+  const decoded = bytes.toString("utf8");
+  if (!Buffer.from(decoded, "utf8").equals(bytes)) fail("Guidance text is not valid UTF-8.");
+  return decoded;
 }
 
 function normalizeKey(value, text) {
@@ -398,7 +431,7 @@ function apply(options) {
   if (!CATEGORIES.has(category)) fail("Category must be commands, conventions, or pitfalls.");
   const evidence = String(options.evidence || "").toLowerCase();
   if (!EVIDENCE.has(evidence)) fail("Evidence must be explicit, verified, or repeated.");
-  const text = normalizeText(options.text);
+  const text = normalizeText(guidanceText(options));
   const key = normalizeKey(options.key, text);
   let result;
   const changed = mutateTextFile(context.target, (content, eol) => {
@@ -416,19 +449,34 @@ async function hook(options) {
   const file = stateFile(context.root, context.host, options);
   const state = readState(file);
   const event = input.hook_event_name;
-  const turnId = input.turn_id || input.session_id || "unknown";
+  const eventTurnId = input.turn_id || input.prompt_id;
+  const synthesizedTurnId = !eventTurnId && event === "UserPromptSubmit";
+  let turnId = eventTurnId;
+  if (synthesizedTurnId) {
+    const previousSequence = Number.isSafeInteger(state.turnSequence) ? state.turnSequence : 0;
+    state.turnSequence = previousSequence + 1;
+    turnId = `${input.session_id || "unknown"}:turn-${state.turnSequence}`;
+  }
+  turnId ||= state.currentTurnId || input.session_id || "unknown";
 
   if (event === "UserPromptSubmit") {
     const candidate = promptCandidate(input.prompt);
     if (!candidate) {
+      let changed = false;
+      if (synthesizedTurnId) {
+        state.currentTurnId = turnId;
+        changed = true;
+      }
       if (state.pendingTurnId && state.pendingTurnId !== turnId) {
         delete state.pendingTurnId;
         delete state.pendingCandidate;
         delete state.promptHash;
-        writeState(file, state);
+        changed = true;
       }
+      if (changed) writeState(file, state);
       return;
     }
+    state.currentTurnId = turnId;
     state.pendingTurnId = turnId;
     state.pendingCandidate = true;
     state.promptHash = createHash("sha256").update(String(input.prompt || "")).digest("hex");
@@ -451,7 +499,7 @@ async function hook(options) {
   if (state.lastAttemptedTurnId === turnId) return;
 
   const pendingMatches = state.pendingCandidate
-    && (!state.pendingTurnId || !input.turn_id || state.pendingTurnId === input.turn_id);
+    && (!state.pendingTurnId || state.pendingTurnId === turnId);
   const candidate = process.env.MAG_FORCE_CANDIDATE === "1"
     || pendingMatches
     || assistantCandidate(input.last_assistant_message);
@@ -470,7 +518,7 @@ function help() {
   process.stdout.write(`  enable  --host codex|claude [--cwd PATH] [--target PATH]\n`);
   process.stdout.write(`  disable --host codex|claude [--cwd PATH] [--target PATH]\n`);
   process.stdout.write(`  status  --host codex|claude [--cwd PATH] [--target PATH]\n`);
-  process.stdout.write(`  apply   --host HOST --category CATEGORY --key KEY --evidence TYPE --text TEXT\n`);
+  process.stdout.write(`  apply   --host HOST --category CATEGORY --key KEY --evidence TYPE (--text TEXT | --text-base64 BASE64)\n`);
   process.stdout.write(`  hook    # reads lifecycle JSON from stdin\n`);
 }
 
