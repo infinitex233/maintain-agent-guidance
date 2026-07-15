@@ -4,7 +4,7 @@ English | [简体中文](README.zh-CN.md)
 
 Maintain Agent Guidance is an opt-in plugin for Codex and Claude Code. After you enable it in a repository, a lightweight lifecycle hook checks each completed turn for durable instructions, verified commands, conventions, and recurring pitfalls. Qualifying items are written to `AGENTS.md` in Codex or `CLAUDE.md` in Claude Code.
 
-The hook stays dormant until the skill is explicitly invoked for the first time. Most turns take the fast no-op path and do not start another model pass.
+Before the skill is explicitly invoked, each hook process exits after checking for the enable marker. It does not write state or request another model pass. Enabled turns that do not match a candidate also take the local no-op path.
 
 ## What it keeps
 
@@ -51,6 +51,14 @@ The updater owns only a marked block inside the target file. Existing human-writ
 ```
 
 Stable semantic keys make repeated updates idempotent and allow newer instructions to replace older ones.
+
+## Lightweight behavior
+
+Codex uses [progressive disclosure](https://learn.chatgpt.com/docs/build-skills.md) for skills. Its normal skill catalog contains the name, description, and file path; the full `SKILL.md` loads only when Codex selects the skill. Using the `o200k_base` tokenizer as an estimate, this plugin adds about 65 tokens to that catalog and its complete skill is about 357 tokens.
+
+Installing and enabling the plugin registers two local Node.js hook processes per turn. Repository maintenance is a separate opt-in: without the enable marker, both processes return after a file check. After enablement, ordinary turns run only local heuristics and, with current hook inputs, do not write state. In a local benchmark on Windows with Node.js 22, the two no-op hooks together took a median 0.18 to 0.20 seconds. Actual time depends on the host machine and filesystem.
+
+A matching candidate requests one extra model continuation. The static skill and hook instructions add roughly 400 tokens, while the total cost depends on the existing conversation and the model's response. Broad phrases such as `must`, `avoid`, or `root cause is` can trigger this check even when the skill ultimately writes nothing. Maintained entries also become normal `AGENTS.md` or `CLAUDE.md` context, so the skill keeps only concise, durable guidance.
 
 ## Requirements
 
