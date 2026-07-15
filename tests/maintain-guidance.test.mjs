@@ -5,6 +5,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  rmSync,
   statSync,
   utimesSync,
   writeFileSync,
@@ -473,6 +474,26 @@ test("concurrent updates serialize without losing entries", async () => {
   for (const result of results) assert.equal(result.status, 0, result.stderr);
   const content = readFileSync(target, "utf8");
   assert.equal((content.match(/mag:key=fixture-rule-/g) ?? []).length, 8);
+});
+
+test("a contender waits for a slow lock handoff", async () => {
+  const { repo, data } = fixture();
+  const target = join(repo, "AGENTS.md");
+  enable(repo, data);
+  const lock = `${target}.maintain-agent-guidance.lock`;
+  writeFileSync(lock, "active", "utf8");
+
+  const pending = runAsync([
+    "apply", "--cwd", repo, "--host", "codex",
+    "--category", "conventions", "--key", "slow-lock-handoff",
+    "--evidence", "verified", "--text", "Wait for a slow lock owner before writing.",
+  ], { cwd: repo, data });
+  await new Promise((resolveWait) => setTimeout(resolveWait, 2_000));
+  rmSync(lock, { force: true });
+  const result = await pending;
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(readFileSync(target, "utf8"), /Wait for a slow lock owner before writing/);
 });
 
 test("stale locks fail closed without changing guidance", () => {

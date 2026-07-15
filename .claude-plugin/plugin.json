@@ -1,6 +1,6 @@
 {
   "name": "maintain-agent-guidance",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Lightweight, opt-in maintenance for durable repository agent guidance.",
   "author": {
     "name": "Zhihao Zhang",

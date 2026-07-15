@@ -10,7 +10,7 @@
       "displayName": "Maintain Agent Guidance",
       "source": ".",
       "description": "Maintain AGENTS.md or CLAUDE.md from durable information found during agent work.",
-      "version": "0.1.1",
+      "version": "0.1.2",
       "author": {
         "name": "Zhihao Zhang"
       },

@@ -25,9 +25,11 @@ const CATEGORIES = new Map([
   ["pitfalls", "Pitfalls"],
 ]);
 const EVIDENCE = new Set(["explicit", "verified", "repeated"]);
-const LOCK_RETRY_COUNT = 40;
+const LOCK_RETRY_COUNT = 160;
 const LOCK_RETRY_DELAY_MS = 25;
 const LOCK_STALE_MS = 30_000;
+const RENAME_RETRY_COUNT = 20;
+const RENAME_RETRY_DELAY_MS = 25;
 
 const DURABLE_PROMPT = /(?:\b(?:always|never|must|remember|prefer|default to|from now on|going forward|do not|don't|avoid)\b|use\s+.+?\s+instead\s+of|以后|始终|总是|永远|必须|务必|不要|禁止|默认|记住|改用|优先|而不是|统一使用)/iu;
 const CORRECTION_PROMPT = /(?:\bnot\s+.+?\s+but\s+|\bcorrection\b|不(?:是|要).+而(?:是|要)|下次|以后别|应该改为)/iu;
@@ -132,6 +134,19 @@ function sleep(milliseconds) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds);
 }
 
+function renameWithRetry(source, target) {
+  for (let attempt = 0; attempt < RENAME_RETRY_COUNT; attempt += 1) {
+    try {
+      renameSync(source, target);
+      return;
+    } catch (error) {
+      const retryable = ["EPERM", "EACCES", "EBUSY"].includes(error.code);
+      if (!retryable || attempt === RENAME_RETRY_COUNT - 1) throw error;
+      sleep(RENAME_RETRY_DELAY_MS);
+    }
+  }
+}
+
 function withLock(file, callback) {
   mkdirSync(dirname(file), { recursive: true });
   const lock = `${file}.maintain-agent-guidance.lock`;
@@ -171,7 +186,7 @@ function atomicWrite(file, text, bom = false) {
   const mode = existsSync(file) ? statSync(file).mode : 0o600;
   writeFileSync(temporary, payload, { mode });
   try {
-    renameSync(temporary, file);
+    renameWithRetry(temporary, file);
   } finally {
     rmSync(temporary, { force: true });
   }
