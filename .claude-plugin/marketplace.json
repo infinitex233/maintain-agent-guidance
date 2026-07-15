@@ -1,0 +1,21 @@
+{
+  "name": "maintain-agent-guidance",
+  "owner": {
+    "name": "Zhihao Zhang"
+  },
+  "description": "An opt-in plugin that keeps durable repository agent guidance current.",
+  "plugins": [
+    {
+      "name": "maintain-agent-guidance",
+      "displayName": "Maintain Agent Guidance",
+      "source": ".",
+      "description": "Maintain AGENTS.md or CLAUDE.md from durable information found during agent work.",
+      "version": "0.1.0",
+      "author": {
+        "name": "Zhihao Zhang"
+      },
+      "category": "productivity",
+      "tags": ["agents", "guidance", "memory", "hooks"]
+    }
+  ]
+}
